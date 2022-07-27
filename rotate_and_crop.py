@@ -2,23 +2,35 @@ import os
 import cv2 as cv
 import dlib
 import numpy as np
-
-# In this program, we crop the faces out and add masks upon them, 
-# then save faces with and without masks seperately for further use
+from skimage.feature import hog
+import sklearn
+from matplotlib import pyplot as plt
 
 # T1  start _______________________________________________________________________________
 # Read in Dataset
 
 # change the dataset path here according to your folder structure
-dataset_path = "D:\\Code_uc\\face_reco\\Dataset_1"
+dataset_path = "Dataset_1"
 
 X = []
-for subject_name in os.listdir(dataset_path):
-    subject_images_dir = os.path.join(dataset_path, subject_name)
+y = []
+
+# naming of subjects
+subject_prefix = "s"
+subject_range = (1, 51)
+
+for subject_index in range(*subject_range):
+
+    subject_name = f"{subject_prefix}{subject_index // 10}{subject_index % 10}"
+
+    y.append(subject_name)
+    subject_images_dir = f"{dataset_path}/{subject_name}"
 
     temp_x_list = []
     for img_name in os.listdir(subject_images_dir):
         # write code to read each 'img'
+        if not img_name.endswith('.jpg'):
+            continue
         img_path = os.path.join(subject_images_dir, img_name)
         img = dlib.load_rgb_image(img_path)
         # add the img to temp_x_list
@@ -29,15 +41,17 @@ for subject_name in os.listdir(dataset_path):
 
 # T2 start __________________________________________________________________________________
 # Preprocessing
+
 X_processed = []
 detector = dlib.get_frontal_face_detector()
-predictor_path = "D:\\Code_uc\\face_reco\\shape_predictor_68_face_landmarks.dat"
+predictor_path = "shape_predictor_68_face_landmarks.dat"
 predictor = dlib.shape_predictor(predictor_path)
-nomask_data_path = "D:\\Code_uc\\face_reco\\dataset_nomask"
+nomask_data_dir = "output/dataset_nomask"
+
 for i, x_list in enumerate(X):
     temp_X_processed = []
-    dir_path = os.path.join(nomask_data_path, f"s{i}")
-    os.makedirs(dir_path)
+    nomask_path = os.path.join(nomask_data_dir, f"s{i}")
+    os.makedirs(nomask_path)
     for j, x in enumerate(x_list):
         # write the code to detect face in the image (x) using dlib facedetection library
         detector = dlib.get_frontal_face_detector()
@@ -46,20 +60,45 @@ for i, x_list in enumerate(X):
         x = dlib.as_grayscale(x)
         shape = predictor(x, det)
         # write the code to crop the image (x) to keep only the face, resize the cropped image to 150x150
-        temp_points = shape.parts()
-        points = np.ndarray(shape=(0, 2), dtype=np.uint8)
+        temp_points = np.array(shape.parts())
+        points: np.ndarray = np.ndarray(shape=(0, 2), dtype=np.uint8)
         for p in temp_points:
             points = np.vstack([points, [p.x, p.y]])
         x_axis, y_axis = points[:, 0], points[:, 1]
+
+        # rotate face by feature points
+        # the feature point chosen are No.8 (the mid point of jaw line) and No.27 (the top point of nose)
+        center = (points[27] + points[8]) / 2
+        center = tuple(center)
+        orient_vec: np.ndarray = points[27] - points[8]
+        angle = np.sign(orient_vec[0]) * np.arccos(-orient_vec[1] /
+                                                   np.linalg.norm(orient_vec))
+        # perform transform
+        rotation_matrix = cv.getRotationMatrix2D(
+            center=center, angle=angle * 180 / np.pi, scale=1)
+        x = cv.warpAffine(
+            src=x, M=rotation_matrix, dsize=(x.shape[1], x.shape[0]))
+        points = np.vstack([points.T, [1] * points.shape[0]])
+        points = (rotation_matrix @ points).T
+
+        # Cut the image to square to avoid distortion
+        x_axis, y_axis = points[:, 0], points[:, 1]
         left, right = np.min(x_axis), np.max(x_axis)
         top, bottom = np.min(y_axis), np.max(y_axis)
-        crp_x = x[top-5:bottom+5, left-5:right+5]
-        crp_x = dlib.resize_image(crp_x, 150, 150)
-        cv.imwrite(os.path.join(dir_path, f"{j}.jpg"), crp_x)
-        # append the converted image into temp_X_processed
-        temp_X_processed.append(crp_x)
+        w, h = right - left, bottom - top
+        if w > h:
+            top -= (w - h) / 2
+            bottom += (w - h) / 2
+        else:
+            left -= (h - w) / 2
+            right += (h - w) / 2
+        margin_ratio = 0.05  # keep margin or not
+        resized_x = x[int(top - margin_ratio * w):int(bottom + margin_ratio * w),
+                      int(left - margin_ratio * w):int(right + margin_ratio * w)]
+        resized_x = dlib.resize_image(resized_x, 150, 150)
+        cv.imwrite(os.path.join(nomask_path, f"{j}.jpg"), resized_x)
 
-    # append temp_X_processed into  X_processed
+        temp_X_processed.append(resized_x)
     X_processed.append(temp_X_processed)
 
 # T2 end ____________________________________________________________________________________
@@ -69,47 +108,25 @@ for i, x_list in enumerate(X):
 # Create masked face dataset
 X_masked = []
 shp_det = dlib.rectangle(0, 0, 149, 149)
-nomask_data_path = "D:\\Code_uc\\face_reco\\dataset_mask"
+mask_data_path = "output/dataset_mask"
 
 for i, x_list in enumerate(X_processed):
     temp_X_masked = []
-    dir_path = os.path.join(nomask_data_path, f"s{i}")
-    os.makedirs(dir_path)
+    mask_path = os.path.join(mask_data_path, f"s{i}")
+    os.makedirs(mask_path)
     for j, x in enumerate(x_list):
         # write the code to detect face in the image (x) using dlib facedetection library
         local_shape = predictor(x, shp_det)
         key_points = local_shape.parts()
-        temp_points = key_points[2:15]
-        temp_points.extend([key_points[31], key_points[35], key_points[27]])
+        temp_points = key_points[1:16]
+        temp_points.extend([key_points[35], key_points[28], key_points[31]])
         mask_points = np.ndarray(shape=(0, 2), dtype=np.uint8)
         for p in temp_points:
             mask_points = np.vstack([mask_points, [p.x, p.y]])
         # write the code to add synthetic mask as shown in the project problem description
-        cv.fillPoly(x, [mask_points[:-1]], color=255)
-        cv.fillPoly(x, [mask_points[-3:]], color=255)
+        cv.fillPoly(x, [mask_points], color=(255, 255, 255))
         # append the converted image into temp_X_masked
-        cv.imwrite(os.path.join(dir_path, f"{j}.jpg"), x)
+        cv.imwrite(os.path.join(mask_path, f"{j}.jpg"), x)
         temp_X_masked.append(x)
     # append temp_X_masked into  X_masked
     X_masked.append(temp_X_masked)
-# T3 end ____________________________________________________________________________________
-
-
-# T4 start __________________________________________________________________________________
-# Build a detector that can detect presence of facemask given an input image
-
-# X_features = []
-# for x_list in X_masked:
-#     temp_X_features = []
-#     for x in x_list:
-#         x_feature = hog(x, orientations=8, pixels_per_cell=(10, 10),
-#                         cells_per_block=(1, 1), visualize=False, multichannel=False)
-#         temp_X_features.append(x_feature)
-#     X_features.append(temp_X_features)
-
-
-# write code to split the dataset into train-set and test-set
-
-# write code to train and test the SVM classifier as the facemask presence detector
-
-# T4 end ____________________________________________________________________________________
